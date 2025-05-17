@@ -178,7 +178,19 @@ def main():
     log("info", "mimi loaded")
     text_tokenizer = checkpoint_info.get_text_tokenizer()
     log("info", "loading moshi")
-    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype)
+    # Add TTT configuration flag - explicitly set to False for debugging
+    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype, 
+                                   lm_kwargs_overrides={'use_ttt': False})
+    
+    # Log TTT configuration status
+    if hasattr(lm, 'use_ttt'):
+        log("info", f"TTT enabled: {lm.use_ttt}")
+        if lm.use_ttt:
+            log("info", f"TTT integration mode: {lm.ttt_integration_mode}")
+            log("info", f"TTT layers: {lm.user_ttt_model.config.num_hidden_layers if lm.user_ttt_model else 'N/A'}")
+    else:
+        log("info", "no-ttt")
+        
     log("info", "moshi loaded")
 
     log("info", f"loading input file {args.infile}")

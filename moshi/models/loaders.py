@@ -253,14 +253,20 @@ class CheckpointInfo:
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.bfloat16,
         load_weight: bool = True,
+        lm_kwargs_overrides: dict = None,
         **kwargs,
     ) -> LMModel:
+        if lm_kwargs_overrides is None:
+            lm_kwargs_overrides = {}
+            
         model = get_moshi_lm(
             self.moshi_weights if load_weight else None,
             lm_kwargs=self.lm_config,
             device=device,
             dtype=dtype,
             lora_weights=self.lora_weights,
+            load_weight=load_weight,
+            lm_kwargs_overrides=lm_kwargs_overrides,
             **kwargs,
         )
         if self.model_type == "hibiki":
@@ -325,41 +331,65 @@ def get_moshi_lm(
     lora_weights: str | Path | None = None,
     fuse_lora: bool = False,
     lm_kwargs_overrides={},
+    load_weight: bool = True,
 ) -> LMModel:
+    import logging
+    logger = logging.getLogger(__name__)
+    
     if lm_kwargs is None:
         lm_kwargs = _lm_kwargs
-    lm_kwargs = dict(lm_kwargs)
-    assert lm_kwargs is not None
+        
+    # Make a mutable copy to update with overrides and TTT defaults
+    current_lm_kwargs = dict(lm_kwargs)
+    assert current_lm_kwargs is not None
+    
+    # Ensure TTT configurations are passed to LMModel if not already in lm_kwargs
+    # These defaults will be used if not specified in the loaded lm_config or overrides
+    current_lm_kwargs.setdefault('use_ttt', False)  # Default to False unless explicitly enabled
+    current_lm_kwargs.setdefault('ttt_integration_mode', 'concat')
+    current_lm_kwargs.setdefault('ttt_integration_weight', 0.5)
+    
+    # Merge lm_kwargs_overrides which might come from training script
+    if lm_kwargs_overrides:
+        current_lm_kwargs.update(lm_kwargs_overrides)
+        
+    # Log TTT configuration
+    logger.info(f"TTT enabled: {current_lm_kwargs.get('use_ttt', False)}")
+    if current_lm_kwargs.get('use_ttt', False):
+        logger.info(f"TTT integration mode: {current_lm_kwargs.get('ttt_integration_mode')}")
+        logger.info(f"TTT integration weight: {current_lm_kwargs.get('ttt_integration_weight')}")
 
-    if "conditioners" in lm_kwargs:
-        lm_kwargs["condition_provider"] = get_conditioner_provider(
-            lm_kwargs["dim"], device, lm_kwargs
+    if "conditioners" in current_lm_kwargs:
+        current_lm_kwargs["condition_provider"] = get_conditioner_provider(
+            current_lm_kwargs["dim"], device, current_lm_kwargs
         )
-        del lm_kwargs["conditioners"]
-    if "fuser" in lm_kwargs:
-        lm_kwargs["fuser"] = get_condition_fuser(lm_kwargs)
-
-    lm_kwargs = lm_kwargs | lm_kwargs_overrides
-    assert lm_kwargs is not None
+        del current_lm_kwargs["conditioners"]
+    if "fuser" in current_lm_kwargs:
+        current_lm_kwargs["fuser"] = get_condition_fuser(current_lm_kwargs)
+        
+    assert current_lm_kwargs is not None
 
     # deprecated params.
-    lm_kwargs.pop("depformer_causal", None)
+    current_lm_kwargs.pop("depformer_causal", None)
 
     # lora params.
-    lora = lm_kwargs.pop("lora", False)
-    lora_rank = lm_kwargs.pop("lora_rank", 128)
-    lora_scaling = lm_kwargs.pop("lora_scaling", 2.0)
+    lora = current_lm_kwargs.pop("lora", False)
+    lora_rank = current_lm_kwargs.pop("lora_rank", 128)
+    lora_scaling = current_lm_kwargs.pop("lora_scaling", 2.0)
 
     init_device = device
-    if filename is not None:
+    if filename is not None and load_weight:
         init_device = torch.device('meta')
 
+    # Log model initialization with TTT info
+    logger.info(f"Initializing LMModel with TTT enabled: {current_lm_kwargs.get('use_ttt', False)}")
+    
     model = LMModel(
         device=init_device,
         dtype=dtype,
-        **lm_kwargs)
+        **current_lm_kwargs)
 
-    if filename is not None:
+    if filename is not None and load_weight:
         if _is_safetensors(filename):
             state = load_file(filename, device=str(device))
             for key, value in state.items():
@@ -369,14 +399,54 @@ def get_moshi_lm(
                     else:
                         value = value.to(dtype)
                 state[key] = value
-            model.load_state_dict(state, assign=True)
+            
+            # Use strict=False to handle TTT model parameters and resized depformer_in layers
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info("Loading state_dict with strict=False to handle architectural changes.")
+            missing_keys, unexpected_keys = model.load_state_dict(state, strict=False, assign=True)
+            
+            if missing_keys:
+                logger.warning(f"Missing keys when loading state_dict: {len(missing_keys)} keys")
+                logger.warning("These may include TTT model parameters and resized depformer_in, which is expected.")
+                
+                # Log a sample of missing keys
+                if len(missing_keys) > 10:
+                    logger.warning(f"Sample of missing keys: {missing_keys[:5]} ... {missing_keys[-5:]}")
+                else:
+                    logger.warning(f"Missing keys: {missing_keys}")
+                    
+            if unexpected_keys:
+                logger.warning(f"Unexpected keys when loading state_dict: {unexpected_keys}")
 
         else:
             pkg = torch.load(filename, "cpu",)
-            model.load_state_dict(pkg["fsdp_best_state"]["model"], assign=True)
+            model_state = pkg.get("fsdp_best_state", {}).get("model", pkg.get("model", pkg))
+            
+            # Apply dtype conversion for .pt files as well
+            for key, value in model_state.items():
+                if value.dtype.is_floating_point:
+                    if key.startswith('condition_provider.') or key.startswith('fuser.'):
+                        model_state[key] = value.float()
+                    else:
+                        model_state[key] = value.to(dtype)
+                        
+            # Use strict=False to handle TTT model parameters and resized depformer_in layers
+            logger.info("Loading state_dict from .pt checkpoint with strict=False.")
+            missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False, assign=True)
+            
+            if missing_keys:
+                logger.warning(f"Missing keys (PT): {len(missing_keys)} keys")
+                if len(missing_keys) > 10:
+                    logger.warning(f"Sample of missing keys: {missing_keys[:5]} ... {missing_keys[-5:]}")
+            if unexpected_keys:
+                logger.warning(f"Unexpected keys (PT): {unexpected_keys}")
+                
+            # After loading to CPU and converting dtypes, move the model to target device
+            model = model.to(device)
 
     if lora:
-        assert not lm_kwargs.get("quantize"), (
+        assert not current_lm_kwargs.get("quantize", False), (
             "LoRA and quantization are incompatible for now."
         )
         model = get_lora_moshi(
@@ -389,9 +459,8 @@ def get_moshi_lm(
             fuse_lora=fuse_lora,
         )
     else:
-        assert lora_weights is None, (
-            "`lora` is False, but received some lora_weights to load."
-        )
+        if lora_weights is not None:
+            logger.warning("`lora` is False, but lora_weights were provided. These will not be loaded unless LoRA is enabled in config.")
     model.eval()
     return model
 

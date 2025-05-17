@@ -25,6 +25,8 @@ from .lm_utils import (_delay_sequence,
                        _undelay_sequence,
                        _init_layer,
                        ScaledEmbedding)
+from .ttt import TTTModel, TTTConfig, TTTCache
+import math
 
 
 logger = logging.getLogger(__name__)
@@ -70,6 +72,10 @@ class LMModel(StreamingContainer):
         depformer_low_rank_embeddings (int | None): if provided, uses low rank embeddings, with a linear
         existing_text_padding_id (int): token to use for the padding.
         same_initial (bool): if True, uses the same initial tokens for both text and audio mode.
+        use_ttt (bool): If True, use TTT model in parallel with temporal transformer.
+        ttt_config_overrides (dict, optional): Dictionary of parameters to override default TTT configuration.
+        ttt_integration_mode (str): How to combine TTT and transformer outputs. Options: 'concat', 'weighted_sum'.
+        ttt_integration_weight (float): Weight for TTT output when using 'weighted_sum' integration mode.
         **kwargs: Additional parameters for the transformer encoder.
     """
 
@@ -103,6 +109,10 @@ class LMModel(StreamingContainer):
         device=None,
         dtype=None,
         gradient_checkpointing: bool = False,
+        use_ttt: bool = False,
+        ttt_config_overrides: tp.Optional[dict] = None,
+        ttt_integration_mode: str = 'concat',
+        ttt_integration_weight: float = 0.5,
         **kwargs,
     ):
         super().__init__()
@@ -151,6 +161,13 @@ class LMModel(StreamingContainer):
             **main_kwargs,
         )
         self.out_norm = create_norm_fn(norm, dim)
+        
+        # Store TTT Control Flags
+        self.use_ttt = use_ttt
+        self.ttt_integration_mode = ttt_integration_mode
+        self.ttt_integration_weight = ttt_integration_weight # Only used if mode is 'weighted_sum'
+        
+        # Original kwargs_dep setup - needed for depformer later
         self.depformer_multi_linear = depformer_multi_linear
         kwargs_dep = main_kwargs.copy()
         kwargs_dep.update(
@@ -165,18 +182,87 @@ class LMModel(StreamingContainer):
         kwargs_dep["cross_attention"] = False
         if depformer_weights_per_step:
             kwargs_dep["weights_per_step"] = dep_q
-        if depformer_multi_linear:
-            # One linear layer per codebook to project different informations from the main model.
-            num_in = dep_q
-            if depformer_weights_per_step_schedule:
-                num_in = max(depformer_weights_per_step_schedule) + 1
-            self.depformer_in = nn.ModuleList(
-                [nn.Linear(dim, depformer_dim, bias=False) for _ in range(num_in)]
-            )
+        
+        self.user_ttt_model: tp.Optional[TTTModel] = None
+        self.user_ttt_config: tp.Optional[TTTConfig] = None
+        self.ttt_projection: tp.Optional[nn.Module] = None
+        self._managed_ttt_cache: tp.Optional[TTTCache] = None # For streaming state
+        
+        if self.use_ttt:
+            logger.info(f"TTT Integration Enabled. Mode: {self.ttt_integration_mode}")
+            
+            # --- Define TTTConfig ---
+            # These are example defaults; make them configurable via ttt_config_overrides
+            # or pass directly to LMModel __init__
+            default_ttt_params = {
+                "hidden_size": self.dim,  # Match Moshi's internal dimension
+                "intermediate_size": int(hidden_scale * self.dim), # Example based on Moshi's hidden_scale
+                "num_hidden_layers": kwargs.get('ttt_num_layers', 6), # Allow override via kwargs
+                "num_attention_heads": num_heads, # Match Moshi's num_heads
+                "max_position_embeddings": self.context if self.context is not None else 2048,
+                "vocab_size": self.text_card + 1,  # Placeholder, as TTTModel will receive embeddings
+                "ttt_layer_type": kwargs.get('ttt_layer_type', 'linear'),
+                "ttt_base_lr": kwargs.get('ttt_base_lr', 1.0),
+                "mini_batch_size": kwargs.get('ttt_mini_batch_size', 16), # TTT's internal mini-batch
+                "use_cache": True,  # Necessary for streaming state management via TTTCache
+                "pad_token_id": 0, "bos_token_id": 1, "eos_token_id": 2, # Required by TTTConfig
+                "pre_conv": kwargs.get('ttt_pre_conv', False),
+                "conv_kernel": kwargs.get('ttt_conv_kernel', 4),
+                "use_gate": kwargs.get('ttt_use_gate', False),
+                "share_qk": kwargs.get('ttt_share_qk', False),
+                "scan_checkpoint_group_size": kwargs.get('ttt_scan_checkpoint_group_size', 0),
+            }
+            if ttt_config_overrides: # Allow a dictionary to override these defaults
+                default_ttt_params.update(ttt_config_overrides)
+
+            self.user_ttt_config = TTTConfig(**default_ttt_params)
+            self.user_ttt_model = TTTModel(self.user_ttt_config)
+
+            # --- TTT Output Projection (Optional but recommended) ---
+            # This layer projects TTT output to self.dim if different, or can be a learned mapping
+            if self.user_ttt_config.hidden_size != self.dim:
+                self.ttt_projection = nn.Linear(self.user_ttt_config.hidden_size, self.dim, bias=False)
+            else:
+                # Even if dims match, a projection might be useful for learning how to best integrate.
+                # For simplicity, start with Identity if dims match.
+                self.ttt_projection = nn.Identity()
+            logger.info(f"TTT model initialized (hidden_size: {self.user_ttt_config.hidden_size}). Projection type: {type(self.ttt_projection)}")
         else:
-            self.depformer_in = nn.ModuleList(
-                [nn.Linear(dim, depformer_dim, bias=False)]
+            logger.info("TTT integration is disabled.")
+
+        # Calculate the effective input dimension for depformer_in
+        if self.use_ttt:
+            if self.ttt_integration_mode == 'concat':
+                # Assuming ttt_projection outputs self.dim
+                effective_input_dim_to_depformer = self.dim + self.dim
+            elif self.ttt_integration_mode == 'weighted_sum':
+                # For weighted sum, both original and TTT (projected) outputs must be self.dim
+                effective_input_dim_to_depformer = self.dim
+            else:
+                raise ValueError(f"Unknown ttt_integration_mode: {self.ttt_integration_mode}")
+        else: # No TTT
+            effective_input_dim_to_depformer = self.dim
+
+        logger.info(f"Effective input dimension to depformer_in layers: {effective_input_dim_to_depformer}")
+
+        # Now, re-initialize self.depformer_in using this effective dimension
+        # The structure (multi_linear or single) remains the same.
+        self.depformer_multi_linear = depformer_multi_linear # Make sure this is set
+
+        # Determine the number of projection layers needed for depformer_in
+        if self.depformer_multi_linear:
+            num_dep_in_projections = self.dep_q # Original uses self.dep_q
+            if self.depformer_weights_per_step_schedule is not None:
+                num_dep_in_projections = max(self.depformer_weights_per_step_schedule) + 1
+        else:
+            num_dep_in_projections = 1
+
+        self.depformer_in = nn.ModuleList()
+        for _ in range(num_dep_in_projections):
+            self.depformer_in.append(
+                nn.Linear(effective_input_dim_to_depformer, depformer_dim, bias=False)
             )
+        
         EmbeddingFactory = partial(EmbeddingFactory, low_rank=depformer_low_rank_embeddings)
         # Only using up to dep_q - 1 because the last codebook is never an input to Depformer.
         self.depformer_emb = nn.ModuleList(
@@ -369,13 +455,77 @@ class LMModel(StreamingContainer):
             input_ = input_ + sum_condition.to(input_)
         if cross_attention_src is not None:
             cross_attention_src = cross_attention_src.to(input_)
+        
+        # Run the original transformer
         transformer_out = self.transformer(input_, cross_attention_src=cross_attention_src)
         if self.out_norm:
             transformer_out = self.out_norm(transformer_out)
         assert isinstance(transformer_out, torch.Tensor)
-        text_logits = self.text_linear(transformer_out)
-        text_logits = text_logits[:, None]
-        return transformer_out, text_logits
+        
+        # Process TTT model in parallel if enabled
+        if self.use_ttt:
+            logger.info(f"Running TTT model in forward_text (integration mode: {self.ttt_integration_mode})")
+            # Generate text logits from transformer alone (for output)
+            text_logits = self.text_linear(transformer_out)
+            text_logits = text_logits[:, None]
+            
+            # Generate position IDs for TTT (required by TTT model)
+            position_ids = torch.arange(S, device=input_.device).unsqueeze(0).expand(B, -1)
+            
+            # Initialize TTT cache if in streaming mode
+            # Note: For non-streaming usage (training), cache_params is None
+            cache_params = None
+            if hasattr(self, '_managed_ttt_cache') and self._managed_ttt_cache is not None:
+                cache_params = self._managed_ttt_cache
+            
+            # Process through TTT model
+            # Input to TTT is the same embedding that went to the transformer
+            # This could be modified to pass a different representation if needed
+            logger.info(f"TTT forward pass with seq_len={S}, batch_size={B}")
+            
+            # Create attention mask since we're not providing input_ids
+            attention_mask = torch.ones((B, S), dtype=torch.long, device=input_.device)
+            
+            ttt_out = self.user_ttt_model(
+                inputs_embeds=input_, 
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                cache_params=cache_params,
+                return_dict=True
+            )
+            
+            # Get TTT's final hidden states
+            ttt_hidden = ttt_out.last_hidden_state
+            
+            # Update cache if provided
+            if cache_params is not None:
+                self._managed_ttt_cache = ttt_out.cache_params
+                logger.info("TTT cache updated in forward_text")
+            
+            # Project TTT output to match transformer dimension if needed
+            ttt_projected = self.ttt_projection(ttt_hidden)
+            
+            # Combine TTT and transformer outputs based on integration mode
+            if self.ttt_integration_mode == 'concat':
+                # Concatenate along the feature dimension
+                combined_out = torch.cat([transformer_out, ttt_projected], dim=-1)
+                logger.info(f"TTT output concatenated with transformer output -> shape: {combined_out.shape}")
+            elif self.ttt_integration_mode == 'weighted_sum':
+                # Weighted sum of the two outputs
+                transformer_weight = 1.0 - self.ttt_integration_weight
+                combined_out = (transformer_weight * transformer_out) + (self.ttt_integration_weight * ttt_projected)
+                logger.info(f"TTT output weighted sum (w={self.ttt_integration_weight}) with transformer output")
+            else:
+                # Should never happen as we validate in __init__, but just in case
+                raise ValueError(f"Unsupported ttt_integration_mode: {self.ttt_integration_mode}")
+            
+            # Return the combined output and the text logits
+            return combined_out, text_logits
+        else:
+            # Original behavior when TTT is disabled
+            text_logits = self.text_linear(transformer_out)
+            text_logits = text_logits[:, None]
+            return transformer_out, text_logits
 
     def forward_depformer_training(
         self,
@@ -430,7 +580,69 @@ class LMModel(StreamingContainer):
             transformer_out.shape[1] == 1
         ), "Transformer out should be a for a single step."
         last_token_input: tp.Optional[torch.Tensor] = None
-        depformer_input = transformer_out
+        
+        # Check if we should process TTT model for streaming
+        if self.use_ttt and hasattr(self, '_managed_ttt_cache'):
+            logger.info(f"Running TTT model in streaming (forward_depformer) for cb_index={depformer_cb_index}")
+            # Generate position IDs for TTT
+            position_ids = torch.zeros((B, 1), device=transformer_out.device, dtype=torch.long)
+            
+            # Get input embedding from the stream cache if possible, otherwise create it
+            # This is simplified and might need to be adjusted based on how streaming works
+            # A proper implementation would extract input embeddings from the transformer cache
+            if hasattr(self, '_last_input_embedding'):
+                input_embeds = self._last_input_embedding
+            else:
+                # Fallback - not ideal but provides a mechanism if embedding not cached
+                # In real streaming, we should have a better mechanism to retrieve the input
+                logger.warning("Using fallback input embedding generation for TTT - implement a proper cache")
+                if depformer_cb_index == 0:
+                    input_embeds = self.text_emb(sequence[:, 0])
+                else:
+                    audio_idx = depformer_cb_index - 1 + self.audio_offset
+                    input_embeds = self.emb[audio_idx - 1](sequence[:, 0])
+            
+            # Process through TTT model with the managed cache
+            logger.info(f"TTT streaming forward pass for batch_size={B}")
+            
+            # Create attention mask since we're not providing input_ids
+            attention_mask = torch.ones((B, 1), dtype=torch.long, device=input_embeds.device)
+            
+            ttt_out = self.user_ttt_model(
+                inputs_embeds=input_embeds.unsqueeze(1),  # Add sequence dimension
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                cache_params=self._managed_ttt_cache,
+                return_dict=True
+            )
+            
+            # Update TTT cache
+            self._managed_ttt_cache = ttt_out.cache_params
+            logger.info("TTT cache updated in streaming")
+            
+            # Project TTT output
+            ttt_projected = self.ttt_projection(ttt_out.last_hidden_state)
+            
+            # Combine with transformer output based on integration mode
+            if self.ttt_integration_mode == 'concat':
+                # Concatenate along feature dimension
+                combined_out = torch.cat([transformer_out, ttt_projected], dim=-1)
+                logger.info(f"TTT streaming: outputs concatenated -> shape: {combined_out.shape}")
+            elif self.ttt_integration_mode == 'weighted_sum':
+                # Weighted sum
+                transformer_weight = 1.0 - self.ttt_integration_weight
+                combined_out = (transformer_weight * transformer_out) + (self.ttt_integration_weight * ttt_projected)
+                logger.info(f"TTT streaming: weighted sum (w={self.ttt_integration_weight})")
+            else:
+                raise ValueError(f"Unsupported ttt_integration_mode: {self.ttt_integration_mode}")
+                
+            # Use the combined output for depformer processing
+            depformer_input = combined_out
+        else:
+            # Original path when TTT is disabled
+            depformer_input = transformer_out
+        
+        # Continue with the original logic using the (potentially combined) depformer_input
         if self.depformer_multi_linear:
             in_index = depformer_cb_index
             if self.depformer_weights_per_step_schedule is not None:
@@ -478,6 +690,23 @@ class LMModel(StreamingContainer):
 
         for linear in self.linears:
             _init_layer(linear)
+            
+        if self.use_ttt:
+            if self.user_ttt_model is not None:
+                logger.info("Applying _init_weights to self.user_ttt_model")
+                # TTTModel has its own _init_weights method.
+                # It's generally better to call the model's own initializer if it exists and is comprehensive.
+                if hasattr(self.user_ttt_model, '_init_weights') and callable(self.user_ttt_model._init_weights):
+                    self.user_ttt_model.apply(self.user_ttt_model._init_weights)
+                else:
+                    # Fallback: Apply Moshi's _init_layer to all submodules of TTTModel.
+                    # This might not be ideal if TTTModel contains layers not handled by _init_layer (e.g., RMSNorm).
+                    logger.warning("TTTModel does not have a callable _init_weights method. Applying generic _init_layer. Review carefully.")
+                    self.user_ttt_model.apply(_init_layer) # Ensure _init_layer is defined in LMModel or accessible
+
+            if self.ttt_projection is not None and isinstance(self.ttt_projection, nn.Linear):
+                logger.info("Initializing self.ttt_projection")
+                _init_layer(self.ttt_projection) # Use the existing _init_layer for Linear
 
 
 @dataclass
@@ -493,11 +722,42 @@ class _LMGenState(State):
     exit_stack: ExitStack = field(default_factory=ExitStack)
     reset_callback: tp.Callable[[torch.Tensor], None] | None = None
     set_exec_mask_callback: tp.Callable[[torch.Tensor], None] | None = None
+    # Tracking the last TTT cache reset to avoid unnecessary resets
+    last_ttt_cache_reset: bool = False
 
     def reset(self, reset_mask: torch.Tensor) -> None:
         super().reset(reset_mask)
         self.offsets[:] = torch.where(reset_mask, torch.zeros_like(self.offsets), self.offsets)
         self.offset_cpu = 0
+        
+        # Reset TTT cache if applicable
+        if reset_mask.any() and not self.last_ttt_cache_reset:
+            # In a streaming generation context, we need to access the parent LMGen instance
+            # to get the lm_model reference. We store this temporarily during reset.
+            # This approach avoids circular imports.
+            from ..modules.streaming import get_active_module
+            active_module = get_active_module()
+            if active_module is not None and hasattr(active_module, 'lm_model'):
+                lm_model = active_module.lm_model
+                if hasattr(lm_model, 'use_ttt') and lm_model.use_ttt:
+                    if hasattr(lm_model, '_managed_ttt_cache') and lm_model._managed_ttt_cache is not None:
+                        logger.info("Resetting TTT cache during state reset")
+                        logger.info(f"TTT model active with {lm_model.user_ttt_config.num_hidden_layers} layers")
+                        # Create a new TTT cache for the model, effectively resetting it
+                        # Note: In a production implementation, we might want a more fine-grained reset
+                        # mechanism that only affects specific batch items based on reset_mask
+                        effective_batch = self.batch_size
+                        if hasattr(active_module, 'cfg_coef') and getattr(active_module, 'cfg_coef', 1.0) != 1.0:
+                            effective_batch *= 2
+                        lm_model._managed_ttt_cache = TTTCache(
+                            model=lm_model.user_ttt_model,
+                            batch_size=effective_batch
+                        )
+                        self.last_ttt_cache_reset = True
+        elif not reset_mask.any():
+            # Reset the tracking flag when no reset is happening
+            self.last_ttt_cache_reset = False
+        
         if self.reset_callback is not None:
             self.reset_callback(reset_mask)
 
@@ -583,6 +843,25 @@ class LMGen(StreamingModule[_LMGenState]):
         graphed_main = CUDAGraphed(lm_model.forward_text, disable=disable)
         graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
 
+        # Initialize TTT cache if TTT is enabled
+        if lm_model.use_ttt and lm_model.user_ttt_model is not None:
+            logger.info("Initializing TTT cache for streaming")
+            logger.info(f"TTT model using {lm_model.ttt_integration_mode} integration with weight={lm_model.ttt_integration_weight}")
+            # Create a TTT cache for streaming
+            if hasattr(lm_model, '_managed_ttt_cache'):
+                logger.info("Reusing existing TTT cache")
+            else:
+                # Note: TTTCache takes a model and batch size
+                effective_batch = batch_size
+                if self.cfg_coef != 1.:
+                    effective_batch *= 2  # Double for CFG
+                
+                lm_model._managed_ttt_cache = TTTCache(
+                    model=lm_model.user_ttt_model, 
+                    batch_size=effective_batch
+                )
+                logger.info(f"Created new TTT cache with batch size {effective_batch}")
+                
         state = _LMGenState(
             batch_size, lm_model.device, cache, initial, graphed_main, graphed_depth,
             offsets, condition_sum=condition_sum, condition_cross=condition_cross)
@@ -617,6 +896,17 @@ class LMGen(StreamingModule[_LMGenState]):
             raise RuntimeError(
                 "You should wrap those calls with a `with lm_gen.streaming(): ...`."
             )
+        
+        # Log every 10 steps to show TTT status
+        if hasattr(self, '_step_counter'):
+            self._step_counter += 1
+            if self._step_counter % 10 == 0:
+                if self.lm_model.use_ttt:
+                    logger.info(f"Generation step {self._step_counter} with TTT enabled")
+        else:
+            self._step_counter = 0
+            if self.lm_model.use_ttt:
+                logger.info("Starting generation with TTT enabled")
         lm_model = self.lm_model
 
         assert input_tokens.dim() == 3, "Shape should be [B, K, T]."

@@ -16,9 +16,19 @@ import abc
 from contextlib import ExitStack
 from dataclasses import dataclass
 import typing as tp
+import weakref
 from torch import nn
 import torch
 from ..utils.compile import CUDAGraphed
+
+# Global storage for the active module
+_active_streaming_module: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
+
+def get_active_module() -> tp.Optional['StreamingModule']:
+    """Get the current active streaming module if any.
+    This is useful for accessing the parent LMGen instance during state operations.
+    """
+    return _active_streaming_module.get('active')
 
 
 @dataclass
@@ -133,7 +143,17 @@ class StreamingModule(abc.ABC, nn.Module, tp.Generic[StateT]):
 
         exit_stack = ExitStack()
         self._start_streaming(batch_size, exit_stack)
-        exit_stack.callback(self._stop_streaming)
+        
+        # Register this module as active
+        _active_streaming_module['active'] = self
+        
+        # Make sure to unregister when exiting
+        def _cleanup():
+            self._stop_streaming()
+            if _active_streaming_module.get('active') == self:
+                _active_streaming_module.pop('active', None)
+                
+        exit_stack.callback(_cleanup)
         return exit_stack
 
     def reset_streaming(self, reset_mask: torch.Tensor | None = None) -> None:
