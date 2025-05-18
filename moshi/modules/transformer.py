@@ -576,10 +576,23 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
 @dataclass
 class _LayerState(State):
     offset_cpu: int = 0
+    ttt_offset: int = 0
+    ttt_cache: tp.Any = None
 
     def reset(self, reset_mask: torch.Tensor):
         super().reset(reset_mask)
         self.offset_cpu = 0
+        self.ttt_offset = 0
+        
+        # Reset TTT cache if it exists and has a reset method
+        if self.ttt_cache is not None and hasattr(self.ttt_cache, 'reset'):
+            try:
+                self.ttt_cache.reset(reset_mask)
+            except Exception as e:
+                # Log error but continue execution
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Error resetting TTT cache: {e}")
 
 
 class StreamingTransformerLayer(StreamingModule[_LayerState]):
@@ -601,6 +614,7 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
             `weights_per_step` is True, e.g. step `I` will use weights `schedule[I]`.
         skip_self_attn: If true, skips the self attention module and the norm
         cross_attention (bool): If True, expect to get secondary input for cross-attention.
+        ttt_config (Optional[dict]): Configuration for TTT integration. Defaults to None.
         device (torch.device, optional): Device on which to initialize.
         dtype (torch.dtype, optional): dtype to use.
     """
@@ -625,9 +639,12 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
         cross_attention: bool = False,
         device=None,
         dtype=None,
+        ttt_config: tp.Optional[dict] = None,
     ):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
+        # Store ttt_config for use in forward method if needed
+        self.ttt_config = ttt_config
         # Redefine self_attn to our streaming multi-head attention
         attn_kwargs: tp.Dict[str, tp.Any] = {
             "embed_dim": d_model,
@@ -720,7 +737,14 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
 
     def _init_streaming_state(self, batch_size: int) -> _LayerState:
         device = next(iter(self.parameters())).device
-        return _LayerState(batch_size, device, offset_cpu=0)
+        
+        # Initialize with TTT-specific state if TTT config is provided
+        if hasattr(self, 'ttt_config') and self.ttt_config is not None:
+            # Initialize with empty TTT cache - this will be managed by LMModel
+            return _LayerState(batch_size, device, offset_cpu=0, ttt_offset=0, ttt_cache=None)
+        else:
+            # Standard initialization without TTT
+            return _LayerState(batch_size, device, offset_cpu=0)
 
     # feed forward block
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
@@ -769,6 +793,23 @@ class StreamingTransformerLayer(StreamingModule[_LayerState]):
                 x = self._cross_attention_block(x, cross_attention_src)
             else:
                 assert cross_attention_src is None
+            
+            # Store TTT-specific state if needed but don't modify the regular forward path
+            # TTT integration happens at the LMModel level, not within individual layers
+            # We just store necessary information in the state for later use
+            if hasattr(self, 'ttt_config') and self.ttt_config is not None:
+                state = self._streaming_state
+                if state is not None and hasattr(state, 'ttt_offset'):
+                    # Update TTT offset if it's being tracked in the state
+                    state.ttt_offset = getattr(state, 'offset_cpu', 0)
+                
+                # Log TTT configuration once per forward (for debugging)
+                if not hasattr(self, '_logged_ttt_config'):
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.debug(f"TTT config in StreamingTransformerLayer: {self.ttt_config}")
+                    self._logged_ttt_config = True
+            
             x = self._ff_block(x)
             state = self._streaming_state
             if state:
@@ -840,8 +881,19 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
 
         self.checkpointing = checkpointing
 
+        # Extract ttt_config from kwargs if it exists
+        ttt_config = kwargs.pop('ttt_config', None)
+
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
+            # Ensure ttt_config is extracted from kwargs and correctly passed to layer_class
+            layer_kwargs = kwargs.copy()
+            if 'ttt_config' in layer_kwargs:
+                # If using a custom layer class, make sure ttt_config is explicitly passed
+                layer_ttt_config = layer_kwargs.pop('ttt_config', None)
+            else:
+                layer_ttt_config = ttt_config
+                
             self.layers.append(
                 layer_class(
                     d_model=d_model,
@@ -852,7 +904,8 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
                     rope=self.rope,
                     device=device,
                     dtype=dtype,
-                    **kwargs,
+                    ttt_config=layer_ttt_config,
+                    **layer_kwargs,
                 )
             )
             if quantize:
