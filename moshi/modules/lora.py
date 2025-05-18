@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 
 def replace_all_linear_with_lora(module, rank: int, scaling: float, device=None, dtype=None):
@@ -14,9 +15,32 @@ def replace_all_linear_with_lora(module, rank: int, scaling: float, device=None,
                 this_dtype = child.weight.dtype
             else:
                 this_dtype = dtype
-            lora = LoRALinear(child.in_features, child.out_features,
-                              rank, scaling, device=this_device, dtype=this_dtype)
+                
+            # Convert child's weights to target dtype if needed
+            if child.weight.dtype != this_dtype:
+                child.weight.data = child.weight.data.to(dtype=this_dtype)
+                if child.bias is not None:
+                    child.bias.data = child.bias.data.to(dtype=this_dtype)
+                    
+            # Create LoRA layer with matching dtype
+            lora = LoRALinear(
+                child.in_features, 
+                child.out_features,
+                rank, 
+                scaling, 
+                bias=child.bias is not None,
+                device=this_device, 
+                dtype=this_dtype
+            )
+            
+            # Ensure frozen weights match dtype
             lora.frozen_W = child
+            
+            # Initialize LoRA weights with correct dtype
+            if rank > 0:
+                lora.lora_A.weight.data = lora.lora_A.weight.data.to(dtype=this_dtype)
+                lora.lora_B.weight.data = lora.lora_B.weight.data.to(dtype=this_dtype)
+                
             setattr(module, name, lora)
         else:
             replace_all_linear_with_lora(child, rank, scaling, device=device, dtype=dtype)
@@ -58,41 +82,29 @@ class LoRALinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        rank: int,
-        scaling: float,
-        bias: bool = False,
-        device: torch.device | None = None,
-        dtype: torch.dtype = torch.bfloat16,
+        rank: int = 0,
+        scaling: float = 1.0,
+        bias: bool = True,
+        device=None,
+        dtype=None,
     ):
         super().__init__()
-
-        self.in_features = in_features
-        self.out_features = out_features
-        assert not bias
-        self.bias = bias
         self.rank = rank
         self.scaling = scaling
-
-        self.lora_A = nn.Linear(
-            self.in_features,
-            self.rank,
-            bias=self.bias,
-            device=device,
-            dtype=dtype,
-        )
-        self.lora_B = nn.Linear(
-            self.rank,
-            self.out_features,
-            bias=self.bias,
-            device=device,
-            dtype=dtype,
-        )
-
-        self.frozen_W = nn.Linear(self.in_features,
-                                  self.out_features,
-                                  bias=self.bias,
-                                  device=device,
-                                  dtype=dtype)
+        self.in_features = in_features
+        self.out_features = out_features
+        
+        # Store dtype for consistent conversions
+        self.lora_dtype = dtype if dtype is not None else torch.get_default_dtype()
+        
+        if rank > 0:
+            self.lora_A = nn.Linear(in_features, rank, bias=False, device=device, dtype=self.lora_dtype)
+            self.lora_B = nn.Linear(rank, out_features, bias=False, device=device, dtype=self.lora_dtype)
+            # Initialize weights for low-rank adaptation
+            nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B.weight)
+        
+        self.frozen_W = nn.Linear(in_features, out_features, bias=bias, device=device, dtype=self.lora_dtype)
 
         self._register_load_state_dict_pre_hook(LoRALinear._load_hook, with_module=True)
 
@@ -113,9 +125,24 @@ class LoRALinear(nn.Module):
             w_ref = state_dict.pop(key_name)
             state_dict[prefix + 'frozen_W.weight'] = w_ref
 
-    def forward(self, x: torch.Tensor):
-        lora = self.lora_B(self.lora_A(x))
-        return self.frozen_W(x) + lora * self.scaling
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure input has the same dtype as LoRA weights
+        if x.dtype != self.lora_dtype:
+            x = x.to(dtype=self.lora_dtype)
+            
+        if self.rank > 0:
+            # Compute LoRA path with explicit dtype casting
+            lora_a_out = self.lora_A(x)  # This will maintain dtype from input
+            lora_b_out = self.lora_B(lora_a_out)  # This will maintain dtype
+            main = self.frozen_W(x)  # Main path
+            
+            # Ensure both paths have same dtype before combining
+            if lora_b_out.dtype != main.dtype:
+                lora_b_out = lora_b_out.to(dtype=main.dtype)
+                
+            return main + self.scaling * lora_b_out
+        else:
+            return self.frozen_W(x)
 
     def __repr__(self) -> str:
         return "{}Linear(in_features={}, out_features={}, r={})".format(
