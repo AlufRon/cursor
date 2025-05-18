@@ -15,6 +15,13 @@ import sentencepiece
 import torch
 import sphn
 
+# Add wandb import
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available, TTT weight change logging will be disabled")
 
 from .client_utils import log, AnyPrinter, Printer, RawPrinter
 from .conditioners import ConditionAttributes, ConditionTensors
@@ -164,6 +171,10 @@ def main():
                         dest="dtype", help="Run inference with float16, not bfloat16, better for old GPUs.")
     parser.add_argument("--config", "--lm-config", dest="config", type=str, help="The config as a json file.")
     parser.add_argument("--cfg-coef", type=float, default=1., help="CFG coefficient.")
+    # Add wandb-related arguments
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging for TTT weight changes.")
+    parser.add_argument("--wandb-project", type=str, default="ttt-monitoring", help="Wandb project name.")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="Wandb run name.")
     parser.add_argument("infile", type=str, help="Input audio file.")
     parser.add_argument("outfile", type=str, help="Output audio file in wav format.", nargs="?", default="")
 
@@ -178,20 +189,40 @@ def main():
     log("info", "mimi loaded")
     text_tokenizer = checkpoint_info.get_text_tokenizer()
     log("info", "loading moshi")
-    # Add TTT configuration flag - explicitly set to False for debugging
-    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype, 
-                                   lm_kwargs_overrides={'use_ttt': False})
+    lm = checkpoint_info.get_moshi(device=args.device, dtype=args.dtype)
     
-    # Log TTT configuration status
-    if hasattr(lm, 'use_ttt'):
-        log("info", f"TTT enabled: {lm.use_ttt}")
-        if lm.use_ttt:
-            log("info", f"TTT integration mode: {lm.ttt_integration_mode}")
-            log("info", f"TTT layers: {lm.user_ttt_model.config.num_hidden_layers if lm.user_ttt_model else 'N/A'}")
-    else:
-        log("info", "no-ttt")
-        
+    # Explicitly ensure the loaded language model and all its parameters are on the target device
+    if isinstance(lm, torch.nn.Module):
+        lm = lm.to(args.device)
+        log("info", f"Ensured LM model is on device: {next(lm.parameters()).device}")
+    
     log("info", "moshi loaded")
+    
+    # Initialize wandb if requested
+    if args.wandb and WANDB_AVAILABLE:
+        log("info", f"Initializing wandb for TTT weight change logging (project: {args.wandb_project})")
+        wandb_config = {
+            "model_type": checkpoint_info.model_type,
+            "batch_size": args.batch_size,
+            "cfg_coef": args.cfg_coef,
+            "device": args.device,
+            "input_file": args.infile,
+        }
+        
+        # If we're using TTTModel, use its built-in method
+        if hasattr(lm, 'user_ttt_model') and hasattr(lm.user_ttt_model, 'init_wandb_logging'):
+            lm.user_ttt_model.init_wandb_logging(
+                project_name=args.wandb_project,
+                run_name=args.wandb_run_name,
+                config=wandb_config
+            )
+        # Otherwise initialize wandb directly
+        else:
+            try:
+                wandb.init(project=args.wandb_project, name=args.wandb_run_name, config=wandb_config)
+                log("info", "Successfully initialized wandb")
+            except Exception as e:
+                log("error", f"Failed to initialize wandb: {e}")
 
     log("info", f"loading input file {args.infile}")
     in_pcms, _ = sphn.read(args.infile, sample_rate=mimi.sample_rate)
