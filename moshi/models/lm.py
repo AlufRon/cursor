@@ -150,7 +150,6 @@ class LMModel(StreamingContainer):
         # Extract TTT-related parameters from main_kwargs
         # (1) First check if TTT is enabled via 'use_ttt' param
         use_ttt = main_kwargs.pop('use_ttt', True)
-        print("ttt"*10)
         # (2) Extract other TTT-specific parameters
         ttt_integration_weight = main_kwargs.pop('ttt_integration_weight', 0.7)
         ttt_base_lr = main_kwargs.pop('ttt_base_lr', 1.0)
@@ -306,9 +305,36 @@ class LMModel(StreamingContainer):
                 
                 self.user_ttt_config = TTTConfig(**ttt_config_params)
                 
-                # Ensure model is created on CPU, not meta device
-                self.user_ttt_model = TTTModel(self.user_ttt_config).to(device=init_device)
-                logger.info(f"Created TTTModel on device: {self.user_ttt_model.device if hasattr(self.user_ttt_model, 'device') else init_device}")
+                # CRITICAL FIX: Force creation on CPU to avoid meta tensor issues
+                with torch.device('cpu'):
+                    self.user_ttt_model = TTTModel(self.user_ttt_config)
+                    logger.info(f"Created TTTModel on CPU to avoid meta tensor issues")
+                    
+                    # Initialize all TTT parameters properly on CPU first
+                    for name, param in self.user_ttt_model.named_parameters():
+                        if param.is_meta:
+                            # Replace meta parameters with actual tensors
+                            if 'weight' in name:
+                                param.data = torch.normal(0, 0.02, size=param.shape, dtype=dtype)
+                            elif 'bias' in name:
+                                param.data = torch.zeros(param.shape, dtype=dtype)
+                            else:
+                                param.data = torch.randn(param.shape, dtype=dtype) * 0.02
+                            logger.info(f"Replaced meta tensor for {name}")
+                        else:
+                            # Ensure correct dtype
+                            param.data = param.data.to(dtype=dtype)
+                
+                # Now move to target device if needed
+                if not is_meta_device and str(init_device) != 'cpu':
+                    self.user_ttt_model = self.user_ttt_model.to(device=init_device)
+                    logger.info(f"Moved TTTModel to device: {init_device}")
+                elif is_meta_device:
+                    logger.info(f"Keeping TTTModel on CPU due to meta device context")
+                
+                # Convert TTT model to target dtype (redundant but safe)
+                logger.info(f"Ensuring TTTModel has dtype: {dtype}")
+                self.user_ttt_model = self.user_ttt_model.to(dtype=dtype)
                 
                 # Ensure use_cache is enabled for TTT model
                 if hasattr(self.user_ttt_model, 'config'):
@@ -322,26 +348,61 @@ class LMModel(StreamingContainer):
                 # Store the TTT integration weight
                 self.ttt_integration_weight = ttt_integration_weight
                 
-                # Projection layer for TTT outputs - explicitly on CPU
+                # Projection layer for TTT outputs - create on CPU first
                 logger.info(f"Initializing TTT projection layer: {self.user_ttt_model.config.hidden_size} -> {dim}")
-                self.ttt_projection = nn.Linear(self.user_ttt_model.config.hidden_size, dim, device=init_device)
+                with torch.device('cpu'):
+                    self.ttt_projection = nn.Linear(self.user_ttt_model.config.hidden_size, dim, bias=True)
+                    
+                    # Initialize projection layer parameters properly
+                    torch.nn.init.normal_(self.ttt_projection.weight, 0, 0.02)
+                    torch.nn.init.zeros_(self.ttt_projection.bias)
+                    
+                    # Convert to target dtype
+                    self.ttt_projection = self.ttt_projection.to(dtype=dtype)
+                    logger.info(f"Created TTT projection layer on CPU with dtype: {dtype}")
                 
-                # Confirm these are not meta tensors
+                # Move to target device if needed
+                if not is_meta_device and str(init_device) != 'cpu':
+                    self.ttt_projection = self.ttt_projection.to(device=init_device)
+                    logger.info(f"Moved TTT projection layer to device: {init_device}")
+                elif is_meta_device:
+                    logger.info(f"Keeping TTT projection layer on CPU due to meta device context")
+                
+                # Confirm these are not meta tensors and convert to target dtype
                 for name, param in self.ttt_projection.named_parameters():
-                    logger.info(f"TTT projection parameter '{name}' created on device {param.device}, is_meta={param.is_meta}")
+                    logger.info(f"TTT projection parameter '{name}' created on device {param.device}, is_meta={param.is_meta}, dtype={param.dtype}")
                 
-                # Initialize parameters explicitly
-                logger.info("Explicitly initializing TTT parameters with proper initialization")
+                # Verify no meta tensors remain
+                logger.info("Verifying TTT parameter initialization...")
+                meta_tensor_count = 0
+                for name, param in self.named_parameters():
+                    if ('ttt_projection' in name or 'user_ttt_model' in name) and param.is_meta:
+                        logger.error(f"CRITICAL: Found remaining meta tensor: {name}")
+                        meta_tensor_count += 1
+                
+                if meta_tensor_count > 0:
+                    logger.error(f"Found {meta_tensor_count} meta tensors in TTT components!")
+                    raise RuntimeError("TTT initialization failed - meta tensors remain")
+                else:
+                    logger.info("✅ All TTT parameters properly initialized (no meta tensors)")
+                
+                # Final verification that all TTT parameters have correct dtype
+                logger.info("Verifying TTT parameter dtypes...")
+                ttt_param_count = 0
+                correct_dtype_count = 0
                 for name, param in self.named_parameters():
                     if 'ttt_projection' in name or 'user_ttt_model' in name:
-                        if param.is_meta:
-                            logger.warning(f"Found meta parameter that should be on CPU: {name}")
-                        if 'weight' in name:
-                            nn.init.uniform_(param, -0.1, 0.1) 
-                            logger.info(f"Initialized {name} with kaiming_uniform_")
-                        elif 'bias' in name:
-                            nn.init.zeros_(param)
-                            logger.info(f"Initialized {name} with zeros_")
+                        ttt_param_count += 1
+                        if param.dtype == dtype:
+                            correct_dtype_count += 1
+                        else:
+                            logger.warning(f"TTT parameter {name} has incorrect dtype {param.dtype}, expected {dtype}")
+                            # Force convert to correct dtype
+                            param.data = param.data.to(dtype)
+                            correct_dtype_count += 1
+                
+                logger.info(f"TTT dtype verification: {correct_dtype_count}/{ttt_param_count} parameters have correct dtype {dtype}")
+                logger.info("TTT components successfully initialized")
             except ImportError as e:
                 logger.error(f"Failed to import TTT modules: {e}")
                 self.user_ttt_model = None
@@ -582,19 +643,22 @@ class LMModel(StreamingContainer):
                 # Create proper position IDs that respect current sequence position
                 position_offset = 0
                 
-                # Use the managed TTT cache if available
+                # CRITICAL FIX: Disable TTT cache during training to avoid in-place operations that break gradients
+                # Only use cache during inference (when not in training mode)
                 ttt_cache_to_pass = None
-                if self._managed_ttt_cache is None:
-                    logger.debug("LMModel: _managed_ttt_cache is None at forward pass")
-                    # Initialize TTT cache if needed and we're in streaming mode
-                    if self.is_streaming:
-                        logger.info(f"LMModel: Creating TTTCache on-demand with batch_size: {B}")
-                        self._managed_ttt_cache = TTTCache(self.user_ttt_model, B)
+                position_offset = 0
                 
-                ttt_cache_to_pass = self._managed_ttt_cache
-                if ttt_cache_to_pass is not None:
+                if not self.training and self.is_streaming:
+                    # Only use cache during inference, not training
+                    if self._managed_ttt_cache is None:
+                        logger.info(f"LMModel: Creating TTTCache for inference with batch_size: {B}")
+                        self._managed_ttt_cache = TTTCache(self.user_ttt_model, B)
+                    
+                    ttt_cache_to_pass = self._managed_ttt_cache
                     position_offset = ttt_cache_to_pass.seqlen_offset
-                    logger.debug(f"LMModel: Using managed TTTCache with position_offset={position_offset}")
+                    logger.debug(f"LMModel: Using managed TTTCache for inference with position_offset={position_offset}")
+                else:
+                    logger.debug(f"LMModel: Disabling TTT cache during training (training={self.training}, streaming={self.is_streaming})")
                 
                 position_ids = torch.arange(
                     position_offset,
@@ -638,15 +702,15 @@ class LMModel(StreamingContainer):
                 assert ttt_input.shape[-1] == self.user_ttt_model.config.hidden_size, \
                     f"Input dimension {ttt_input.shape[-1]} doesn't match TTT model's expected dimension {self.user_ttt_model.config.hidden_size}"
                 
-                # Run TTT model with proper caching - CRITICAL FIX: USING ttt_input INSTEAD OF input_
+                # Run TTT model - disable cache during training to avoid in-place gradient issues
                 ttt_outputs = self.user_ttt_model(
-                    inputs_embeds=ttt_input,  # FIXED: Use projected input
+                    inputs_embeds=ttt_input,  # Use projected input
                     attention_mask=attention_mask,
                     position_ids=position_ids,
-                    cache_params=ttt_cache_to_pass,
+                    cache_params=ttt_cache_to_pass,  # None during training, cache during inference
                     output_hidden_states=False,
                     return_dict=True,
-                    use_cache=self.user_ttt_model.config.use_cache
+                    use_cache=not self.training and self.user_ttt_model.config.use_cache  # Disable cache during training
                 )
                 ttt_transformer_out = ttt_outputs.last_hidden_state
                 logger.info(f"TTT transformer output shape: {ttt_transformer_out.shape}")

@@ -22,7 +22,7 @@ from transformers.utils.import_utils import is_causal_conv1d_available
 try:
     import wandb
     WANDB_AVAILABLE = True
-    wandb.init()
+    # TTT will use existing wandb run from training, or create one if none exists
 
 except ImportError:
     WANDB_AVAILABLE = False
@@ -552,12 +552,10 @@ class TTTCache:
 
         self.conv_states_dic = defaultdict(dict)
         logger.info(f"Creating cache of size: {batch_size}")
-        print(f"DEBUG TTTCache: model device = {model.device}, model dtype = {next(model.parameters()).dtype}")
         
         for layer_idx in range(config.num_hidden_layers):
             for name in self.ttt_param_names:
                 weight = getattr(model.layers[layer_idx].seq_modeling_block, name)
-                print(f"DEBUG TTTCache: Original {name} dtype = {weight.dtype}, device = {weight.device}")
                 
                 # Ensure weights are on the correct device AND have correct dtype
                 # This prevents potential dtype mismatches when these are used later
@@ -565,7 +563,6 @@ class TTTCache:
                     device=model.device, 
                     dtype=weight.dtype  # Ensure we maintain the original dtype
                 )
-                print(f"DEBUG TTTCache: Tiled {name} dtype = {tiled_weight.dtype}")
                 
                 self.ttt_params_dict[f"{name}_states"][layer_idx] = tiled_weight
                 # for decoding, we need to store the gradients as well
@@ -599,7 +596,6 @@ class TTTCache:
                 )
 
     def update(self, py_tree, layer_idx, seq_len):
-        print(f"DEBUG TTTCache.update: seq_len={seq_len}, mini_batch_size={self.mini_batch_size}")
         
         if seq_len % self.mini_batch_size == 0:
             # copy last mini-batch states, clear gradients
@@ -655,18 +651,25 @@ class TTTCache:
         This method calculates and logs aggregate metrics about the TTT model's
         current adaptation state, such as average weight changes across layers.
         """
-        if not WANDB_AVAILABLE:
+        if not WANDB_AVAILABLE or not wandb.run:
             return
             
         try:
-            # Calculate aggregate metrics across all layers
+            # Calculate aggregate metrics across available layers
             avg_w1_norm = 0
             avg_w2_norm = 0
             avg_b1_norm = 0
             avg_b2_norm = 0
             layer_count = 0
             
-            for layer_idx in range(self.model.config.num_hidden_layers):
+            # Iterate through available layers (not hardcoded layer count)
+            available_layers = set()
+            if "W1_states" in self.ttt_params_dict:
+                available_layers.update(self.ttt_params_dict["W1_states"].keys())
+            if "W2_states" in self.ttt_params_dict:
+                available_layers.update(self.ttt_params_dict["W2_states"].keys())
+            
+            for layer_idx in available_layers:
                 if "W1_states" in self.ttt_params_dict and self.ttt_params_dict["W1_states"][layer_idx] is not None:
                     avg_w1_norm += torch.norm(self.ttt_params_dict["W1_states"][layer_idx]).item()
                     avg_b1_norm += torch.norm(self.ttt_params_dict["b1_states"][layer_idx]).item()
@@ -697,7 +700,8 @@ class TTTCache:
                 
                 wandb.log(metrics)
         except Exception as e:
-            print(f"Error logging TTT state to wandb: {e}")
+            # Silently ignore wandb logging errors to not interrupt inference
+            pass
             
     def ttt_params_to_dict(self, layer_idx):
         return {name: self.ttt_params_dict[name][layer_idx] for name in self.ttt_params_dict}
@@ -1129,7 +1133,7 @@ class TTTLinear(TTTBase):
             XQW_mini_batch = XQ_mini_batch + Z1_bar
 
             # --- wandb logging for weight changes and inner loss, per layer ---
-            if WANDB_AVAILABLE and cache_params is not None and last_mini_batch_params_dict is not None:
+            if WANDB_AVAILABLE and last_mini_batch_params_dict is not None:
                 try:
                     # Calculate weight changes
                     w1_change = torch.norm(W1_last - params_dict["W1_states"]).item()
@@ -1139,13 +1143,29 @@ class TTTLinear(TTTBase):
                     # This is an approximation of the inner loss that TTT is minimizing
                     reconstruction_loss = torch.norm(reconstruction_target).item()
                     
-                    # Log to wandb
-                    wandb.log({
-                        f"TTT_W1_Change_Layer_{self.layer_idx}": w1_change,
-                        f"TTT_b1_Change_Layer_{self.layer_idx}": b1_change,
-                        f"TTT_ReconstructionLoss_Layer_{self.layer_idx}": reconstruction_loss,
-                        "Step": cache_params.seqlen_offset if hasattr(cache_params, "seqlen_offset") else 0
-                    })
+                    # Get step count - use cache if available, otherwise use a global counter
+                    if cache_params is not None and hasattr(cache_params, "seqlen_offset"):
+                        step_count = cache_params.seqlen_offset
+                    else:
+                        # For training mode when cache is None, use a global step counter
+                        if not hasattr(wandb, '_ttt_step_counter'):
+                            wandb._ttt_step_counter = 0
+                        wandb._ttt_step_counter += 1
+                        step_count = wandb._ttt_step_counter
+                    
+                    # Log to wandb - use existing run or create fallback
+                    if wandb.run:
+                        # Use existing wandb run from training
+                        wandb.log({
+                            f"TTT_W1_Change_Layer_{self.layer_idx}": w1_change,
+                            f"TTT_b1_Change_Layer_{self.layer_idx}": b1_change,
+                            f"TTT_ReconstructionLoss_Layer_{self.layer_idx}": reconstruction_loss,
+                            f"TTT_Training_Mode_Layer_{self.layer_idx}": 1.0 if cache_params is None else 0.0,
+                            "TTT_Step": step_count
+                        })
+                    else:
+                        # Fallback: create TTT-specific run if no training wandb exists
+                        print(f"TTT Layer {self.layer_idx}: W1_change={w1_change:.6f}, b1_change={b1_change:.6f}, reconstruction_loss={reconstruction_loss:.6f}")
                 except Exception as e:
                     print(f"Error logging TTT metrics to wandb: {e}")
             # --- end wandb logging ---
@@ -1347,7 +1367,7 @@ class TTTMLP(TTTBase):
             XQW_mini_batch = XQ_mini_batch + Z2_bar
 
             # --- wandb logging for weight changes and inner loss, per layer ---
-            if WANDB_AVAILABLE and cache_params is not None and last_mini_batch_params_dict is not None:
+            if WANDB_AVAILABLE and last_mini_batch_params_dict is not None:
                 try:
                     # Calculate weight changes
                     w1_change = torch.norm(W1_last - params_dict["W1_states"]).item()
@@ -1359,17 +1379,33 @@ class TTTMLP(TTTBase):
                     # This is an approximation of the inner loss that TTT is minimizing
                     reconstruction_loss = torch.norm(reconstruction_target).item()
                     
-                    # Log to wandb
-                    wandb.log({
-                        f"TTT_W1_Change_Layer_{self.layer_idx}": w1_change,
-                        f"TTT_b1_Change_Layer_{self.layer_idx}": b1_change,
-                        f"TTT_W2_Change_Layer_{self.layer_idx}": w2_change,
-                        f"TTT_b2_Change_Layer_{self.layer_idx}": b2_change,
-                        f"TTT_ReconstructionLoss_Layer_{self.layer_idx}": reconstruction_loss,
-                        "Step": cache_params.seqlen_offset if hasattr(cache_params, "seqlen_offset") else 0
-                    })
+                    # Get step count - use cache if available, otherwise use a global counter
+                    if cache_params is not None and hasattr(cache_params, "seqlen_offset"):
+                        step_count = cache_params.seqlen_offset
+                    else:
+                        # For training mode when cache is None, use a global step counter
+                        if not hasattr(wandb, '_ttt_mlp_step_counter'):
+                            wandb._ttt_mlp_step_counter = 0
+                        wandb._ttt_mlp_step_counter += 1
+                        step_count = wandb._ttt_mlp_step_counter
+                    
+                    # Log to wandb - use existing run or create fallback
+                    if wandb.run:
+                        # Use existing wandb run from training
+                        wandb.log({
+                            f"TTT_MLP_W1_Change_Layer_{self.layer_idx}": w1_change,
+                            f"TTT_MLP_b1_Change_Layer_{self.layer_idx}": b1_change,
+                            f"TTT_MLP_W2_Change_Layer_{self.layer_idx}": w2_change,
+                            f"TTT_MLP_b2_Change_Layer_{self.layer_idx}": b2_change,
+                            f"TTT_MLP_ReconstructionLoss_Layer_{self.layer_idx}": reconstruction_loss,
+                            f"TTT_MLP_Training_Mode_Layer_{self.layer_idx}": 1.0 if cache_params is None else 0.0,
+                            "TTT_MLP_Step": step_count
+                        })
+                    else:
+                        # Fallback: create TTT-specific run if no training wandb exists
+                        print(f"TTT MLP Layer {self.layer_idx}: W1_change={w1_change:.6f}, W2_change={w2_change:.6f}, reconstruction_loss={reconstruction_loss:.6f}")
                 except Exception as e:
-                    print(f"Error logging TTT metrics to wandb: {e}")
+                    print(f"Error logging TTT MLP metrics to wandb: {e}")
             # --- end wandb logging ---
 
             last_param_dict = {

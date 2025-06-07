@@ -175,6 +175,7 @@ def main():
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging for TTT weight changes.")
     parser.add_argument("--wandb-project", type=str, default="ttt-monitoring", help="Wandb project name.")
     parser.add_argument("--wandb-run-name", type=str, default=None, help="Wandb run name.")
+    parser.add_argument("--enable-ttt-cache", action="store_true", help="Enable TTT cache for real-time adaptation during inference.")
     parser.add_argument("infile", type=str, help="Input audio file.")
     parser.add_argument("outfile", type=str, help="Output audio file in wav format.", nargs="?", default="")
 
@@ -195,6 +196,14 @@ def main():
     if isinstance(lm, torch.nn.Module):
         lm = lm.to(args.device)
         log("info", f"Ensured LM model is on device: {next(lm.parameters()).device}")
+    
+    # Enable TTT cache for inference if requested and TTT is available
+    if args.enable_ttt_cache and hasattr(lm, 'use_ttt') and lm.use_ttt:
+        log("info", "Enabling TTT cache for real-time adaptation during inference")
+        lm.eval()  # Ensure we're in eval mode for TTT cache
+        # TTT cache will be automatically enabled in eval mode
+    elif hasattr(lm, 'use_ttt') and lm.use_ttt:
+        log("info", "TTT detected but cache disabled (use --enable-ttt-cache to enable real-time adaptation)")
     
     log("info", "moshi loaded")
     
@@ -243,7 +252,7 @@ def main():
                 outfile_ = outfile
             duration = out_pcm.shape[1] / mimi.sample_rate
             log("info", f"writing {outfile_} with duration {duration:.1f} sec.")
-            sphn.write_wav(str(outfile_), out_pcm[0].numpy(), sample_rate=mimi.sample_rate)
+            sphn.write_wav(str(outfile_), out_pcm[0].numpy(), sample_rate=mimi.sample_rate) 
 
 
 if __name__ == "__main__":

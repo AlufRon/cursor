@@ -881,18 +881,33 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
 
         self.checkpointing = checkpointing
 
-        # Extract ttt_config from kwargs if it exists
+        # Extract ttt_config from kwargs to avoid passing it to layer_class
+        # which doesn't expect TTT-specific parameters
         ttt_config = kwargs.pop('ttt_config', None)
+        
+        # Keep track of whether TTT is enabled to decide what to pass to layers
+        use_ttt = False
+        if ttt_config is not None:
+            use_ttt = ttt_config.get('use_ttt', False)
+        
+        # Filter out any TTT-specific parameters from kwargs
+        # to prevent them from being passed to StreamingTransformerLayer
+        safe_kwargs = {}
+        for k, v in kwargs.items():
+            # Skip any TTT-specific parameters
+            if not k.startswith('ttt_'):
+                safe_kwargs[k] = v
 
         self.layers = nn.ModuleList()
         for _ in range(num_layers):
-            # Ensure ttt_config is extracted from kwargs and correctly passed to layer_class
-            layer_kwargs = kwargs.copy()
-            if 'ttt_config' in layer_kwargs:
-                # If using a custom layer class, make sure ttt_config is explicitly passed
-                layer_ttt_config = layer_kwargs.pop('ttt_config', None)
-            else:
-                layer_ttt_config = ttt_config
+            # Only pass ttt_config (not individual ttt_ params) if layer class expects it
+            layer_kwargs = safe_kwargs.copy()
+            
+            # Only pass ttt_config if the layer class constructor accepts it
+            import inspect
+            layer_init_params = inspect.signature(layer_class.__init__).parameters
+            if 'ttt_config' in layer_init_params and use_ttt:
+                layer_kwargs['ttt_config'] = ttt_config
                 
             self.layers.append(
                 layer_class(
@@ -904,7 +919,6 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
                     rope=self.rope,
                     device=device,
                     dtype=dtype,
-                    ttt_config=layer_ttt_config,
                     **layer_kwargs,
                 )
             )

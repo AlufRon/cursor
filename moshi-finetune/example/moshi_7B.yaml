@@ -22,7 +22,7 @@ text_padding_weight: .5
 duration_sec: 100
 batch_size: 16
 max_steps: 2000
-gradient_checkpointing: true
+gradient_checkpointing: false  # DISABLED: TTT incompatible with gradient checkpointing
 optim:
   lr: 2e-6
   weight_decay: 0.1

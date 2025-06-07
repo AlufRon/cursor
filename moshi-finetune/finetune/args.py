@@ -21,6 +21,45 @@ class LoraArgs(Serializable):
 
 
 @dataclass
+class TTTArgs(Serializable):
+    # Whether to use TTT model within LMModel
+    use_ttt: bool = False
+    # For compatibility with code that checks ttt.enable
+    enable: bool = False
+    # TTT layer type: "linear" or "mlp"
+    ttt_layer_type: str = "linear"
+    # Base learning rate for TTT inner loop optimizer
+    ttt_base_lr: float = 1.0
+    # Mini-batch size for TTT internal updates
+    ttt_mini_batch_size: int = 16
+    # Weight for combining Moshi and TTT outputs
+    ttt_integration_weight: float = 0.5
+    # TTT model architecture parameters
+    ttt_hidden_size: int = 1024
+    ttt_intermediate_size: int = 4096
+    ttt_num_hidden_layers: int = 6
+    ttt_num_attention_heads: int = 8
+    ttt_max_position_embeddings: int = 2048
+    ttt_vocab_size: int | None = None  # If None, will use text_card from LMModel
+    ttt_pre_conv: bool = False
+    ttt_conv_kernel: int = 4
+    ttt_use_gate: bool = False
+    ttt_scan_checkpoint_group_size: int = 0
+
+    def __post_init__(self) -> None:
+        # Keep use_ttt and enable in sync
+        self.enable = self.use_ttt
+        self.use_ttt = self.enable
+
+        if self.use_ttt:
+            assert self.ttt_hidden_size > 0
+            assert self.ttt_intermediate_size > 0
+            assert self.ttt_num_hidden_layers > 0
+            assert self.ttt_num_attention_heads > 0
+            assert self.ttt_max_position_embeddings > 0
+
+
+@dataclass
 class OptimArgs(Serializable):
     lr: float = 1e-4
     weight_decay: float = 0.1
@@ -106,6 +145,11 @@ class TrainArgs(Serializable):
 
     # LoRA
     lora: LoraArgs | None = field(default_factory=LoraArgs)
+    
+    # TTT parameters
+    ttt: TTTArgs | None = field(default_factory=TTTArgs)
+    
+    # Full fine-tuning flag
     full_finetuning: bool = False
 
     param_dtype: str = "bfloat16"

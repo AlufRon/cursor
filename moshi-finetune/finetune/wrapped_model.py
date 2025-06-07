@@ -33,12 +33,23 @@ def get_fsdp_policy(is_lora: bool) -> Callable[[torch.nn.Module], bool]:
       every trainable and non-trainable parameter group since this is a
       requirement for mixed requires_grad=True/False training. See:
       https://pytorch.org/docs/stable/fsdp.html
+    - TTT model components are also wrapped as separate FSDP groups if present
     """
+    # Try to import TTT components if available
+    try:
+        from moshi.models.ttt import TTTLinear, TTTMLP, Block
+        has_ttt = True
+        logger.info("TTT components successfully imported for FSDP policy.")
+        ttt_layer_classes = (TTTLinear, TTTMLP, Block)
+    except ImportError:
+        has_ttt = False
+        logger.info("TTT components not available for FSDP policy.")
+        ttt_layer_classes = tuple()
 
     # Each transformer block becomes a FSDP group, each being sharded separately
     transformer_block_wrap_policy = functools.partial(
         torch_wrap.transformer_auto_wrap_policy,
-        transformer_layer_cls=(StreamingTransformerLayer,),
+        transformer_layer_cls=(StreamingTransformerLayer,) + ttt_layer_classes if has_ttt else (StreamingTransformerLayer,),
     )
 
     if not is_lora:
@@ -104,6 +115,7 @@ def get_fsdp_model(args: TrainArgs, checkpointer_info: CheckpointInfo) -> FullyS
             - param_dtype: The data type for model parameters (e.g., "bfloat16", "float32").
             - gradient_checkpointing: Whether to enable gradient checkpointing.
             - lora: Configuration for LoRA fine-tuning, including enabling, rank, and scaling.
+            - ttt: Configuration for TTT model, including enabling and architecture parameters.
             - full_finetuning: Whether to enable full model fine-tuning or only LoRA fine-tuning.
         checkpointer_info: provide the initial checkpoint to train from.
     Notes:
@@ -116,16 +128,46 @@ def get_fsdp_model(args: TrainArgs, checkpointer_info: CheckpointInfo) -> FullyS
     elif args.param_dtype == "float32":
         param_dtype = torch.float32
 
+    # Prepare model kwargs overrides with both LoRA and TTT parameters if enabled
+    lm_kwargs_overrides = {
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "lora": args.lora.enable,
+        "lora_rank": args.lora.rank,
+        "lora_scaling": args.lora.scaling,
+    }
+    
+    # Add TTT parameters if TTT is enabled
+    if args.ttt and (args.ttt.use_ttt or args.ttt.enable):
+        main_logger_info("Adding TTT parameters to model initialization")
+        
+        # Add TTT parameters directly to lm_kwargs_overrides (not nested)
+        # LMModel expects these parameters at the top level, not in a nested dict
+        lm_kwargs_overrides.update({
+            "use_ttt": True,
+            "ttt_layer_type": args.ttt.ttt_layer_type,
+            "ttt_base_lr": args.ttt.ttt_base_lr,
+            "ttt_mini_batch_size": args.ttt.ttt_mini_batch_size,
+            "ttt_integration_weight": args.ttt.ttt_integration_weight,
+            "ttt_hidden_size": args.ttt.ttt_hidden_size,
+            "ttt_intermediate_size": args.ttt.ttt_intermediate_size,
+            "ttt_num_hidden_layers": args.ttt.ttt_num_hidden_layers,
+            "ttt_num_attention_heads": args.ttt.ttt_num_attention_heads,
+            "ttt_max_position_embeddings": args.ttt.ttt_max_position_embeddings,
+            "ttt_pre_conv": args.ttt.ttt_pre_conv,
+            "ttt_conv_kernel": args.ttt.ttt_conv_kernel,
+            "ttt_use_gate": args.ttt.ttt_use_gate,
+            "ttt_scan_checkpoint_group_size": args.ttt.ttt_scan_checkpoint_group_size,
+        })
+        
+        # Only add ttt_vocab_size if it's specified
+        if args.ttt.ttt_vocab_size is not None:
+            lm_kwargs_overrides["ttt_vocab_size"] = args.ttt.ttt_vocab_size
+
     with torch.device("meta"):
         model = checkpointer_info.get_moshi(
             device="meta",
             dtype=param_dtype,
-            lm_kwargs_overrides={
-                "gradient_checkpointing": args.gradient_checkpointing,
-                "lora": args.lora.enable,
-                "lora_rank": args.lora.rank,
-                "lora_scaling": args.lora.scaling,
-            },
+            lm_kwargs_overrides=lm_kwargs_overrides,
             load_weight=False,
         )
 
@@ -146,6 +188,13 @@ def get_fsdp_model(args: TrainArgs, checkpointer_info: CheckpointInfo) -> FullyS
             logger.info("Initializing lora layers ...")
             # initialize LoRA layers
             initialize_lora_parameters(model, param_dtype)
+
+        # Log whether the TTT model was initialized
+        if hasattr(model, 'user_ttt_model') and model.user_ttt_model is not None:
+            logger.info("TTT model was successfully initialized")
+            logger.info(f"TTT model config: {model.user_ttt_config}")
+        elif args.ttt and (args.ttt.use_ttt or args.ttt.enable):
+            logger.warning("TTT model was not initialized despite being enabled in config")
 
         assert not any(p.is_meta for p in model.parameters()), (
             "All parameters should be initialized by now"
@@ -175,9 +224,13 @@ def get_fsdp_model(args: TrainArgs, checkpointer_info: CheckpointInfo) -> FullyS
                 param.requires_grad = True
             elif args.lora.ft_embed and "emb" in name:
                 param.requires_grad = True
+            elif args.ttt and (args.ttt.use_ttt or args.ttt.enable) and ("ttt" in name.lower() or "user_ttt" in name):
+                # Keep TTT parameters trainable when TTT is enabled
+                param.requires_grad = True
             else:
                 param.requires_grad = False
     else:
+        # In full fine-tuning mode, all parameters are trainable
         for param in model.parameters():
             param.requires_grad = True
 
@@ -200,8 +253,6 @@ def get_fsdp_model(args: TrainArgs, checkpointer_info: CheckpointInfo) -> FullyS
         use_orig_params=True,
     )
 
-    main_logger_info("Model sharded!")
-
+    # log model parameters
     log_train_params(wrapped_model)
-
     return wrapped_model

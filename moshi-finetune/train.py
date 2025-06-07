@@ -25,6 +25,7 @@ from finetune.distributed import (
     set_device,
 )
 from finetune.eval import evaluate
+from finetune.fix_dynamo import apply_dynamo_fixes
 from finetune.loss import compute_loss_with_mask
 from finetune.mixed_precision import (
     downcast_mixed_precision,
@@ -51,6 +52,9 @@ def main_logger_info(message: str) -> None:
 
 
 def train(config: str):
+    # Apply torch dynamo fixes for TTT compilation
+    apply_dynamo_fixes()
+    
     args: TrainArgs = TrainArgs.load(config, drop_extra_fields=False)
     set_logger(logging.INFO)
 
@@ -216,6 +220,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             optimizer=optimizer,
             num_ckpt_keep=args.num_ckpt_keep,
             full_finetuning=args.full_finetuning,
+            training_args=args,  # Pass complete training args for metadata
         )
     # 9. Prepare mixed precision
     prepare_mixed_precision(

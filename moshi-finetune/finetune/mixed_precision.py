@@ -29,11 +29,22 @@ def upcast_mixed_precision(
     with torch.no_grad():
         for p in params:
             if p.requires_grad and p.grad is not None:
-                # store original tensor in p._temp
-                p._temp = p.data  # type: ignore
-                # upcast data for the optimizer step
-                p.data = p._mp_param  # type: ignore
-                p.grad = p.grad.to(optim_dtype)
+                # Check if parameter has _mp_param (TTT parameters might not have it)
+                if hasattr(p, '_mp_param'):
+                    # store original tensor in p._temp
+                    p._temp = p.data  # type: ignore
+                    # upcast data for the optimizer step
+                    p.data = p._mp_param  # type: ignore
+                    p.grad = p.grad.to(optim_dtype)
+                else:
+                    # For parameters without _mp_param (like TTT), create it on-demand
+                    p._mp_param = torch.empty_like(p, dtype=optim_dtype)  # type: ignore
+                    p._mp_param.copy_(p.to(optim_dtype))  # type: ignore
+                    # store original tensor in p._temp
+                    p._temp = p.data  # type: ignore
+                    # upcast data for the optimizer step
+                    p.data = p._mp_param  # type: ignore
+                    p.grad = p.grad.to(optim_dtype)
 
 
 def downcast_mixed_precision(
@@ -46,8 +57,14 @@ def downcast_mixed_precision(
     with torch.no_grad():
         for p in params:
             if p.requires_grad and p.grad is not None:
-                # copy fp32 weights into bfloat16 tensor
-                p._temp.copy_(p.data)  # type: ignore
-                # set _temp again to the data tensor
-                p.data = p._temp  # type: ignore
-                p.grad = p.grad.to(param_dtype)
+                # Check if parameter has _temp (should be set in upcast_mixed_precision)
+                if hasattr(p, '_temp'):
+                    # copy fp32 weights into bfloat16 tensor
+                    p._temp.copy_(p.data)  # type: ignore
+                    # set _temp again to the data tensor
+                    p.data = p._temp  # type: ignore
+                    p.grad = p.grad.to(param_dtype)
+                else:
+                    # Fallback: directly convert parameter data and grad
+                    p.data = p.data.to(param_dtype)
+                    p.grad = p.grad.to(param_dtype)

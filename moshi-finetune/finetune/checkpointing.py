@@ -22,7 +22,7 @@ def main_logger_info(message: str) -> None:
 
 
 class Checkpointer:
-    """A class to save PyTorch model and optimizer states"""
+    """A class to save PyTorch model and optimizer states with complete training metadata"""
 
     def __init__(
         self,
@@ -33,6 +33,7 @@ class Checkpointer:
         optimizer: torch.optim.Optimizer | None = None,
         num_ckpt_keep: int | None = None,
         full_finetuning: bool = False,
+        training_args=None,  # Add training args to capture complete config
     ):
         self.model = model
         self.optimizer = optimizer
@@ -42,6 +43,7 @@ class Checkpointer:
         self.num_ckpt_keep = num_ckpt_keep
         self.full_finetuning = full_finetuning
         self.config = config
+        self.training_args = training_args  # Store for metadata extraction
 
     @property
     def ckpt_dir(self) -> Path:
@@ -79,10 +81,177 @@ class Checkpointer:
 
         return ckpts_to_delete
 
+    def extract_lora_config(self) -> dict:
+        """Extract LoRA configuration from the model"""
+        lora_config = {"enabled": False}
+        
+        # Find any LoRA layer to extract config
+        for module in self.model.modules():
+            if isinstance(module, LoRALinear):
+                lora_config = {
+                    "enabled": True,
+                    "rank": module.rank,
+                    "scaling": module.scaling,
+                    "in_features": module.in_features,
+                    "out_features": module.out_features,
+                }
+                break
+        
+        return lora_config
+
+    def extract_ttt_config(self) -> dict:
+        """Extract TTT configuration from the model"""
+        ttt_config = {"enabled": False}
+        
+        # Get the actual model (unwrap FSDP if needed)
+        actual_model = self.model
+        if isinstance(self.model, FullyShardedDataParallel):
+            actual_model = self.model.module if hasattr(self.model, 'module') else self.model
+        
+        # Extract TTT config if TTT is enabled
+        if hasattr(actual_model, 'user_ttt_model') and actual_model.user_ttt_model is not None:
+            # Get the raw TTT config
+            raw_config = actual_model.user_ttt_config.to_dict() if hasattr(actual_model.user_ttt_config, 'to_dict') else vars(actual_model.user_ttt_config)
+            
+            # Convert parameter names to model-expected format
+            model_config = {}
+            for key, value in raw_config.items():
+                if key == "hidden_size":
+                    model_config["ttt_hidden_size"] = value
+                elif key == "intermediate_size":
+                    model_config["ttt_intermediate_size"] = value
+                elif key == "num_hidden_layers":
+                    model_config["ttt_num_hidden_layers"] = value
+                elif key == "num_attention_heads":
+                    model_config["ttt_num_attention_heads"] = value
+                elif key == "max_position_embeddings":
+                    model_config["ttt_max_position_embeddings"] = value
+                elif key == "layer_type":
+                    model_config["ttt_layer_type"] = value
+                elif key == "pre_conv":
+                    model_config["ttt_pre_conv"] = value
+                elif key == "conv_kernel":
+                    model_config["ttt_conv_kernel"] = value
+                elif key == "use_gate":
+                    model_config["ttt_use_gate"] = value
+                elif key == "scan_checkpoint_group_size":
+                    model_config["ttt_scan_checkpoint_group_size"] = value
+                else:
+                    # Keep other parameters as-is
+                    model_config[key] = value
+            
+            ttt_config = {
+                "enabled": True,
+                "config": model_config,
+                "integration_weight": getattr(actual_model, 'ttt_integration_weight', 0.5),
+                "has_input_projection": hasattr(actual_model, 'ttt_input_projection'),
+                "has_output_projection": hasattr(actual_model, 'ttt_output_projection'),
+                "has_projection": hasattr(actual_model, 'ttt_projection'),
+            }
+            
+            # Add projection layer dimensions if they exist
+            if hasattr(actual_model, 'ttt_input_projection'):
+                ttt_config["input_projection_dims"] = {
+                    "in_features": actual_model.ttt_input_projection.in_features,
+                    "out_features": actual_model.ttt_input_projection.out_features,
+                }
+            
+            if hasattr(actual_model, 'ttt_output_projection'):
+                ttt_config["output_projection_dims"] = {
+                    "in_features": actual_model.ttt_output_projection.in_features,
+                    "out_features": actual_model.ttt_output_projection.out_features,
+                }
+                
+            if hasattr(actual_model, 'ttt_projection'):
+                ttt_config["projection_dims"] = {
+                    "in_features": actual_model.ttt_projection.in_features,
+                    "out_features": actual_model.ttt_projection.out_features,
+                }
+        
+        return ttt_config
+
+    def extract_model_architecture_config(self) -> dict:
+        """Extract complete model architecture configuration"""
+        actual_model = self.model
+        if isinstance(self.model, FullyShardedDataParallel):
+            actual_model = self.model.module if hasattr(self.model, 'module') else self.model
+        
+        architecture_config = {
+            "model_class": actual_model.__class__.__name__,
+            "dtype": str(actual_model.dtype) if hasattr(actual_model, 'dtype') else "unknown",
+            "device": str(actual_model.device) if hasattr(actual_model, 'device') else "unknown",
+            "dim": getattr(actual_model, 'dim', None),
+            "num_heads": getattr(actual_model, 'num_heads', None),
+            "num_layers": getattr(actual_model, 'num_layers', None),
+            "text_card": getattr(actual_model, 'text_card', None),
+            "card": getattr(actual_model, 'card', None),
+            "n_q": getattr(actual_model, 'n_q', None),
+            "dep_q": getattr(actual_model, 'dep_q', None),
+        }
+        
+        return architecture_config
+
+    def extract_parameter_shapes(self) -> dict:
+        """Extract all parameter shapes for validation"""
+        parameter_shapes = {}
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:  # Only trainable parameters
+                parameter_shapes[name] = list(param.shape)
+        
+        return parameter_shapes
+
+    def create_training_metadata(self) -> dict:
+        """Create complete training metadata for exact architecture reconstruction"""
+        metadata = {
+            "version": "1.0",
+            "checkpoint_type": "lora_ttt" if not self.full_finetuning else "full_finetune",
+            "training_step": self.state.step,
+            
+            # Architecture configurations
+            "lora_config": self.extract_lora_config(),
+            "ttt_config": self.extract_ttt_config(),
+            "model_architecture": self.extract_model_architecture_config(),
+            "parameter_shapes": self.extract_parameter_shapes(),
+            
+            # Training configurations
+            "training_config": self.config,
+            "full_finetuning": self.full_finetuning,
+            
+            # Training args if available
+            "training_args": None,
+        }
+        
+        # Add training args if available
+        if self.training_args is not None:
+            try:
+                # Convert training args to dict (handle dataclass)
+                if hasattr(self.training_args, '__dict__'):
+                    training_args_dict = {}
+                    for key, value in self.training_args.__dict__.items():
+                        try:
+                            # Handle nested dataclasses
+                            if hasattr(value, '__dict__') and not isinstance(value, (str, int, float, bool, type(None))):
+                                training_args_dict[key] = value.__dict__
+                            else:
+                                training_args_dict[key] = value
+                        except:
+                            training_args_dict[key] = str(value)
+                    metadata["training_args"] = training_args_dict
+            except Exception as e:
+                logger.warning(f"Could not serialize training_args: {e}")
+        
+        return metadata
+
     def write_params_info(self, tmp_dst: Path):
         params_path = tmp_dst / "config.json"
+        
+        # Create enhanced config with complete metadata
+        enhanced_config = dict(self.config)
+        enhanced_config["checkpoint_metadata"] = self.create_training_metadata()
+        
         with open(params_path, "w") as f:
-            f.write(json.dumps(self.config, indent=4))
+            f.write(json.dumps(enhanced_config, indent=4))
 
     @staticmethod
     def get_non_lora_states(
@@ -210,13 +379,31 @@ class Checkpointer:
         barrier()
 
         if self.rank == 0:
-            # save checkpoint in tmp path
+            # Create complete training metadata
+            training_metadata = self.create_training_metadata()
+            
+            # Convert metadata to strings for safetensors compatibility
+            metadata_strings = {}
+            for key, value in training_metadata.items():
+                if isinstance(value, dict):
+                    metadata_strings[key] = json.dumps(value)
+                else:
+                    metadata_strings[key] = str(value)
+            
+            # Save checkpoint in tmp path with metadata
             safetensors.torch.save_file(
                 states,
                 self.consolidated_path(
                     tmp_dst, save_only_lora=save_only_lora
-                ),  # always use safetensors for checkpointing
+                ),
+                metadata=metadata_strings,  # Include complete training metadata
             )
+            
+            # Also save metadata as separate JSON for easy inspection
+            metadata_path = tmp_dst / "training_metadata.json"
+            with open(metadata_path, "w") as f:
+                json.dump(training_metadata, f, indent=4)
+            
             self.write_params_info(tmp_dst)
             assert not self.dst_dir.exists(), f"should not happen! {self.dst_dir}"
             tmp_dst.rename(self.dst_dir)
@@ -224,6 +411,7 @@ class Checkpointer:
             logger.info(
                 f"Done dumping checkpoint in {self.dst_dir} for step: {self.state.step}"
             )
+            logger.info(f"Saved complete training metadata for exact architecture reconstruction")
 
             # delete last n checkpoints
             if self.num_ckpt_keep is not None:
